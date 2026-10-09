@@ -257,6 +257,86 @@ export const MENU: MenuItem[] = [
     category: "Desserts",
     image: "/images/dish-1610661314181-1809ea1b0484.jpg",
   },
+  {
+    id: 24,
+    name: "Beef Pulao",
+    urdu: "بیف پلاؤ",
+    description:
+      "Fragrant basmati rice cooked in a savoury beef yakhni with whole spices.",
+    price: 420,
+    category: "Rice",
+    image: "/images/dish-1599043513900-ed6fe01d3833.jpg",
+  },
+  {
+    id: 25,
+    name: "Chicken Pulao",
+    urdu: "چکن پلاؤ",
+    description:
+      "Tender chicken and aromatic basmati rice simmered together in spiced broth.",
+    price: 300,
+    category: "Rice",
+    image: "/images/dish-1599043513900-ed6fe01d3833.jpg",
+  },
+  {
+    id: 26,
+    name: "Garlic Naan",
+    urdu: "لہسن نان",
+    description:
+      "Soft tandoor-baked naan finished with garlic, herbs, and a touch of butter.",
+    price: 70,
+    category: "Breads",
+    image: "/images/dish-1655979284091-eea0e93405ee.jpg",
+  },
+  {
+    id: 27,
+    name: "Aloo Paratha",
+    urdu: "آلو پراٹھا",
+    description:
+      "Golden griddled whole-wheat flatbread filled with seasoned potatoes.",
+    price: 100,
+    category: "Breads",
+    image: "/images/dish-1640625314547-aee9a7696589.jpg",
+  },
+  {
+    id: 28,
+    name: "Mint Lemonade",
+    urdu: "پودینے کا لیموں پانی",
+    description:
+      "A chilled, freshly squeezed lemonade blended with cooling mint.",
+    price: 120,
+    category: "Drinks",
+    image: "/images/dish-1683533698971-dcc5e19cb0f1.jpg",
+  },
+  {
+    id: 29,
+    name: "Fresh Lime Soda",
+    urdu: "تازہ لائم سوڈا",
+    description:
+      "Fresh lime juice topped with sparkling soda and served over ice.",
+    price: 130,
+    category: "Drinks",
+    image: "/images/dish-1683533698971-dcc5e19cb0f1.jpg",
+  },
+  {
+    id: 30,
+    name: "Shahi Tukray",
+    urdu: "شاہی ٹکڑے",
+    description:
+      "Crisp bread in silky cardamom milk, finished with nuts and saffron.",
+    price: 140,
+    category: "Desserts",
+    image: "/images/dish-1574810134700-b6ba48d151a0.jpg",
+  },
+  {
+    id: 31,
+    name: "Gajar Halwa",
+    urdu: "گاجر کا حلوہ",
+    description:
+      "Warm carrot halwa slow-cooked with milk, cardamom, and crushed nuts.",
+    price: 150,
+    category: "Desserts",
+    image: "/images/dish-1574810134700-b6ba48d151a0.jpg",
+  },
 ]
 
 export const CATEGORIES = [

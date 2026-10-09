@@ -2,7 +2,9 @@ node_modules/
 dist/
 build/
 .cache/
+.firebase/
 .env*
+!.env.example
 .vite/
 vite.config.*.timestamp-*
 *.tsbuildinfo

@@ -12,11 +12,36 @@ import {
   type MenuItem,
   type CartItem,
 } from "./menu"
+import {
+  ADMIN_EMAIL,
+  auth,
+  createOrder,
+  firebaseConfigured,
+  getAuthErrorMessage,
+  importLegacyData,
+  saveCafeSettings,
+  saveCustomers as persistCustomers,
+  saveMenuItems,
+  saveOrders as persistOrders,
+  signInAdmin,
+  signOutAdmin,
+  subscribeAdminData,
+  subscribeMenu,
+  subscribeSettings,
+  type CafeSettings,
+  type CustomerData,
+  type LegacyCafeData,
+  type OrderData,
+} from "./firebase"
+import { onAuthStateChanged, type User } from "firebase/auth"
 
 const GRILL_IMAGE = "/images/grill.jpg"
 const FOOD_IMAGE = "/images/meal.jpg"
 const INTERIOR_IMAGE = "/images/interior.jpg"
 const MONEY = (value: number) => `Rs. ${value.toLocaleString("en-PK")}`
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
 type IconName = "arrow" | "bag" | "close" | "plus" | "minus" | "menu" | "leaf" | "flame" | "heart" | "check" | "grid" | "utensils" | "settings" | "logout" | "lock" | "search" | "edit" | "message"
 
 interface IconProps {
@@ -237,65 +262,6 @@ function Dialog({
   )
 }
 
-function getStored<T>(key: string, fallback: T): T {
-  try {
-    const value = localStorage.getItem(key)
-    return value ? JSON.parse(value) : fallback
-  } catch {
-    return fallback
-  }
-}
-function getMenu(): MenuItem[] {
-  const stored = getStored<unknown>("lalazar.menu.v1", null)
-  if (!Array.isArray(stored) || stored.length === 0) return MENU
-
-  const merged = MENU.map((original) => {
-    const item = stored.find((value) => value?.id === original.id)
-    if (
-      !item ||
-      typeof item.name !== "string" ||
-      typeof item.price !== "number" ||
-      item.price <= 0 ||
-      !Number.isFinite(item.price)
-    )
-      return original
-    return {
-      ...original,
-      name: item.name,
-      price: item.price,
-      description:
-        typeof item.description === "string"
-          ? item.description
-          : original.description,
-      category:
-        typeof item.category === "string" ? item.category : original.category,
-      image: typeof item.image === "string" ? item.image : original.image,
-      available: item.available !== false,
-    }
-  })
-
-  const extras = stored.filter(
-    (item) => !MENU.some((original) => original.id === item?.id),
-  )
-
-  return [
-    ...merged,
-    ...extras.filter(
-      (item): item is MenuItem =>
-        typeof item === "object" &&
-        item !== null &&
-        typeof (item as MenuItem).name === "string" &&
-        typeof (item as MenuItem).price === "number",
-    ),
-  ]
-}
-function sessionActive() {
-  try {
-    return sessionStorage.getItem("lalazar.demo.session") === "active"
-  } catch {
-    return false
-  }
-}
 type OrderStatus =
   | "Pending"
   | "Confirmed"
@@ -304,57 +270,21 @@ type OrderStatus =
   | "Delivered"
   | "Cancelled"
 
-interface RequestRecord {
-  id: string
-  items: number
-  total: number
-  time: string
-}
+type CustomerRecord = CustomerData
+type CustomerOrderRecord = OrderData
+type ContactInfo = CafeSettings
+type RevenuePeriod = "day" | "week" | "month"
 
-interface CustomerRecord {
-  id: string
-  name: string
-  phone: string
-  email: string
-  address: string
-  notes: string
-  createdAt: string
-}
-
-interface OrderLineItem {
-  id: number
-  name: string
-  qty: number
-  price: number
+interface RevenueBucket {
+  key: string
+  label: string
+  amount: number
 }
 
 interface OrderTimelineEntry {
   status: OrderStatus
   time: string
   note: string
-}
-
-interface CustomerOrderRecord {
-  id: string
-  customerId: string
-  customerName: string
-  customerPhone: string
-  customerAddress: string
-  items: OrderLineItem[]
-  subtotal: number
-  status: OrderStatus
-  createdAt: string
-  updatedAt: string
-  deadlineMinutes: number
-  notes: string
-  timeline: OrderTimelineEntry[]
-}
-
-interface ContactInfo {
-  phone: string
-  email: string
-  address: string
-  hours: string
 }
 
 const ORDER_STATUS_FLOW: OrderStatus[] = [
@@ -372,49 +302,185 @@ const DEFAULT_CONTACT_INFO: ContactInfo = {
   hours: "11:00 AM - 11:00 PM",
 }
 
-function toPhoneDigits(value: string) {
-  return value.replace(/\D/g, "")
+function readLegacyValue(key: string): unknown {
+  const raw = localStorage.getItem(key)
+  if (raw === null) return undefined
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new Error(`Saved browser data "${key}" is not valid JSON.`)
+  }
 }
 
-function getCustomers(): CustomerRecord[] {
-  const stored = getStored<unknown>("lalazar.customers.v1", [])
-  if (!Array.isArray(stored)) return []
-  return stored.filter(
-    (value): value is CustomerRecord =>
-      typeof value === "object" &&
-      value !== null &&
-      typeof (value as CustomerRecord).id === "string" &&
-      typeof (value as CustomerRecord).name === "string",
+function isLegacyMenuItem(value: unknown): value is MenuItem {
+  if (typeof value !== "object" || value === null) return false
+  const item = value as Record<string, unknown>
+  return (
+    typeof item.id === "number" &&
+    typeof item.name === "string" &&
+    typeof item.urdu === "string" &&
+    typeof item.description === "string" &&
+    typeof item.price === "number" &&
+    Number.isFinite(item.price) &&
+    item.price > 0 &&
+    typeof item.category === "string" &&
+    typeof item.image === "string"
   )
 }
 
-function getCustomerOrders(): CustomerOrderRecord[] {
-  const stored = getStored<unknown>("lalazar.orders.v1", [])
-  if (!Array.isArray(stored)) return []
-  return stored.filter(
-    (value): value is CustomerOrderRecord =>
-      typeof value === "object" &&
-      value !== null &&
-      typeof (value as CustomerOrderRecord).id === "string",
+function isLegacyCustomer(value: unknown): value is CustomerRecord {
+  if (typeof value !== "object" || value === null) return false
+  const record = value as Record<string, unknown>
+  return (
+    typeof record.id === "string" &&
+    typeof record.name === "string" &&
+    typeof record.phone === "string" &&
+    typeof record.email === "string" &&
+    typeof record.address === "string" &&
+    typeof record.notes === "string" &&
+    typeof record.createdAt === "string" &&
+    (record.orderId === undefined || typeof record.orderId === "string")
   )
 }
 
-function getContactInfo(): ContactInfo {
-  const stored = getStored<unknown>("lalazar.contact.v1", DEFAULT_CONTACT_INFO)
-  if (
-    typeof stored === "object" &&
-    stored !== null &&
-    typeof (stored as ContactInfo).email === "string" &&
-    typeof (stored as ContactInfo).address === "string"
-  ) {
-    return {
-      phone: typeof (stored as ContactInfo).phone === "string" ? (stored as ContactInfo).phone : DEFAULT_CONTACT_INFO.phone,
-      email: (stored as ContactInfo).email,
-      address: (stored as ContactInfo).address,
-      hours: typeof (stored as ContactInfo).hours === "string" ? (stored as ContactInfo).hours : DEFAULT_CONTACT_INFO.hours,
+function isLegacyOrderStatus(value: unknown): value is OrderStatus {
+  return (
+    value === "Pending" ||
+    value === "Confirmed" ||
+    value === "Preparing" ||
+    value === "Out for delivery" ||
+    value === "Delivered" ||
+    value === "Cancelled"
+  )
+}
+
+function isLegacyOrder(value: unknown): value is CustomerOrderRecord {
+  if (typeof value !== "object" || value === null) return false
+  const record = value as Record<string, unknown>
+  const validItems =
+    Array.isArray(record.items) &&
+    record.items.every(
+      (item) =>
+        typeof item === "object" &&
+        item !== null &&
+        typeof item.id === "number" &&
+        typeof item.name === "string" &&
+        typeof item.qty === "number" &&
+        Number.isInteger(item.qty) &&
+        item.qty > 0 &&
+        typeof item.price === "number" &&
+        Number.isFinite(item.price),
+    )
+  const validTimeline =
+    Array.isArray(record.timeline) &&
+    record.timeline.every(
+      (entry) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        isLegacyOrderStatus(entry.status) &&
+        typeof entry.time === "string" &&
+        typeof entry.note === "string",
+    )
+  return (
+    typeof record.id === "string" &&
+    typeof record.customerId === "string" &&
+    typeof record.customerName === "string" &&
+    typeof record.customerPhone === "string" &&
+    typeof record.customerAddress === "string" &&
+    validItems &&
+    typeof record.subtotal === "number" &&
+    isLegacyOrderStatus(record.status) &&
+    typeof record.createdAt === "string" &&
+    typeof record.updatedAt === "string" &&
+    typeof record.deadlineMinutes === "number" &&
+    typeof record.notes === "string" &&
+    validTimeline
+  )
+}
+
+function readLegacyData(): LegacyCafeData {
+  const data: LegacyCafeData = {}
+  const menu = readLegacyValue("lalazar.menu.v1")
+  if (menu !== undefined) {
+    if (!Array.isArray(menu)) {
+      throw new Error("Saved browser menu data is not a list.")
+    }
+    if (menu.length === 0) {
+      data.menu = MENU
+    } else {
+      if (!menu.every(isLegacyMenuItem)) {
+        throw new Error("Some saved browser menu items are invalid.")
+      }
+      data.menu = menu
     }
   }
-  return DEFAULT_CONTACT_INFO
+
+  const customers = readLegacyValue("lalazar.customers.v1")
+  if (customers !== undefined) {
+    if (!Array.isArray(customers) || !customers.every(isLegacyCustomer)) {
+      throw new Error("Some saved browser customer records are invalid.")
+    }
+    if (customers.length > 0) data.customers = customers
+  }
+
+  const orders = readLegacyValue("lalazar.orders.v1")
+  if (orders !== undefined) {
+    if (!Array.isArray(orders) || !orders.every(isLegacyOrder)) {
+      throw new Error("Some saved browser orders are invalid.")
+    }
+    if (orders.length > 0) data.orders = orders
+  }
+
+  const savedContact = readLegacyValue("lalazar.contact.v1")
+  const savedWhatsapp = readLegacyValue("lalazar.whatsapp.v1")
+  if (savedContact !== undefined || savedWhatsapp !== undefined) {
+    const contactRecord =
+      typeof savedContact === "object" && savedContact !== null
+        ? (savedContact as Record<string, unknown>)
+        : {}
+    const validContact =
+      typeof contactRecord.email === "string" &&
+      typeof contactRecord.address === "string"
+        ? {
+            email: contactRecord.email,
+            address: contactRecord.address,
+            phone: typeof contactRecord.phone === "string"
+              ? contactRecord.phone
+              : DEFAULT_CONTACT_INFO.phone,
+            hours: typeof contactRecord.hours === "string"
+              ? contactRecord.hours
+              : DEFAULT_CONTACT_INFO.hours,
+          }
+        : {}
+    const phone =
+      typeof savedWhatsapp === "string" &&
+      /^\d{10,15}$/.test(savedWhatsapp.replace(/\D/g, ""))
+        ? savedWhatsapp.replace(/\D/g, "")
+        : typeof validContact.phone === "string"
+          ? validContact.phone
+          : DEFAULT_CONTACT_INFO.phone
+    data.settings = {
+      ...DEFAULT_CONTACT_INFO,
+      ...validContact,
+      phone,
+    }
+  }
+  return data
+}
+
+function clearImportedLegacyData(imported: {
+  menu: number
+  customers: number
+  orders: number
+  settings: boolean
+}) {
+  if (imported.menu) localStorage.removeItem("lalazar.menu.v1")
+  if (imported.customers) localStorage.removeItem("lalazar.customers.v1")
+  if (imported.orders) localStorage.removeItem("lalazar.orders.v1")
+  if (imported.settings) {
+    localStorage.removeItem("lalazar.contact.v1")
+    localStorage.removeItem("lalazar.whatsapp.v1")
+  }
 }
 
 function createTimeline(
@@ -455,27 +521,184 @@ function getOrderDeadlineText(order: CustomerOrderRecord) {
   return `Due in ${minutesLeft} min`
 }
 
-export default function App() {
-  const [menu, setMenu] = useState<MenuItem[]>(getMenu)
-  const [whatsapp, setWhatsapp] = useState(() => {
-    const saved = getStored<string>("lalazar.whatsapp.v1", WHATSAPP_NUMBER)
-    return typeof saved === "string" && /^\d{10,15}$/.test(saved)
-      ? saved
-      : WHATSAPP_NUMBER
+const REVENUE_STATUSES = new Set<OrderStatus>([
+  "Confirmed",
+  "Preparing",
+  "Out for delivery",
+  "Delivered",
+])
+
+function getLocalDateKey(date: Date, includeHour = false) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  const day = String(date.getDate()).padStart(2, "0")
+  const hour = String(date.getHours()).padStart(2, "0")
+  return `${year}-${month}-${day}${includeHour ? `-${hour}` : ""}`
+}
+
+function getRevenueBuckets(
+  orders: CustomerOrderRecord[],
+  period: RevenuePeriod,
+  now = new Date(),
+): RevenueBucket[] {
+  const start = new Date(now)
+  start.setHours(0, 0, 0, 0)
+  if (period === "week") {
+    start.setDate(start.getDate() - ((start.getDay() + 6) % 7))
+  } else if (period === "month") {
+    start.setDate(1)
+  }
+
+  const count =
+    period === "day"
+      ? 24
+      : period === "week"
+        ? 7
+        : new Date(start.getFullYear(), start.getMonth() + 1, 0).getDate()
+  const buckets = Array.from({ length: count }, (_, index) => {
+    const date = new Date(start)
+    if (period === "day") {
+      date.setHours(index)
+    } else {
+      date.setDate(start.getDate() + index)
+    }
+    return {
+      key: getLocalDateKey(date, period === "day"),
+      label:
+        period === "day"
+          ? date.toLocaleTimeString("en", { hour: "numeric" })
+          : period === "week"
+            ? date.toLocaleDateString("en", { weekday: "short" })
+            : String(date.getDate()),
+      amount: 0,
+    }
   })
-  const [customers, setCustomers] = useState<CustomerRecord[]>(getCustomers)
-  const [orders, setOrders] = useState<CustomerOrderRecord[]>(getCustomerOrders)
-  const [contactInfo, setContactInfo] = useState<ContactInfo>(getContactInfo)
+  const bucketByKey = new Map(buckets.map((bucket) => [bucket.key, bucket]))
+
+  for (const order of orders) {
+    if (!REVENUE_STATUSES.has(order.status)) continue
+    const createdAt = new Date(order.createdAt)
+    if (!Number.isFinite(createdAt.getTime())) continue
+    const key = getLocalDateKey(createdAt, period === "day")
+    const bucket = bucketByKey.get(key)
+    if (bucket && Number.isFinite(order.subtotal) && order.subtotal > 0) {
+      bucket.amount += order.subtotal
+    }
+  }
+
+  return buckets
+}
+
+function countUniqueCustomers(orders: CustomerOrderRecord[]) {
+  return new Set(
+    orders
+      .filter((order) => order.status !== "Cancelled")
+      .map((order) => order.customerPhone.replace(/\D/g, ""))
+      .filter(Boolean),
+  ).size
+}
+
+function countRepeatCustomers(orders: CustomerOrderRecord[]) {
+  const ordersByPhone = new Map<string, number>()
+  for (const order of orders) {
+    if (order.status === "Cancelled") continue
+    const phone = order.customerPhone.replace(/\D/g, "")
+    if (phone) ordersByPhone.set(phone, (ordersByPhone.get(phone) ?? 0) + 1)
+  }
+  return [...ordersByPhone.values()].filter((count) => count > 1).length
+}
+
+export default function App() {
+  const [menu, setMenu] = useState<MenuItem[]>(MENU)
+  const [whatsapp, setWhatsapp] = useState(WHATSAPP_NUMBER)
+  const [customers, setCustomers] = useState<CustomerRecord[]>([])
+  const [orders, setOrders] = useState<CustomerOrderRecord[]>([])
+  const [contactInfo, setContactInfo] =
+    useState<ContactInfo>(DEFAULT_CONTACT_INFO)
   const [route, setRoute] = useState(window.location.hash)
-  const [authenticated, setAuthenticated] = useState(sessionActive)
+  const [user, setUser] = useState<User | null>(null)
+  const [authReady, setAuthReady] = useState(!auth)
+  const authenticated =
+    user?.email?.toLowerCase() === ADMIN_EMAIL && user.emailVerified
   const [cart, setCart] = useState<CartItem[]>([])
   const [category, setCategory] = useState("All")
   const [expanded, setExpanded] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const [overlay, setOverlay] =
     useState<"cart" | "checkout" | "reservation" | null>(null)
-  const [requests, setRequests] = useState<RequestRecord[]>([])
   const [notice, setNotice] = useState("")
+  useEffect(() => {
+    if (!auth) return
+    return onAuthStateChanged(auth, (nextUser) => {
+      setUser(nextUser)
+      setAuthReady(true)
+    })
+  }, [])
+  useEffect(() => {
+    if (!firebaseConfigured) {
+      setNotice("Firebase is not configured. Add the Web app values to .env.local.")
+      return
+    }
+    const reportError = (error: Error) => {
+      setNotice(`Firebase error: ${error.message}`)
+    }
+    const unsubscribeMenu = subscribeMenu(setMenu, reportError)
+    const unsubscribeSettings = subscribeSettings((settings) => {
+      const next = { ...DEFAULT_CONTACT_INFO, ...settings }
+      setContactInfo(next)
+      if (/^\d{10,15}$/.test(next.phone.replace(/\D/g, ""))) {
+        setWhatsapp(next.phone.replace(/\D/g, ""))
+      }
+    }, reportError)
+    return () => {
+      unsubscribeMenu()
+      unsubscribeSettings()
+    }
+  }, [])
+  useEffect(() => {
+    if (!authenticated) {
+      setCustomers([])
+      setOrders([])
+      return
+    }
+    return subscribeAdminData(setOrders, setCustomers, (error) => {
+      setNotice(`Could not load cafe records from Firebase: ${error.message}`)
+    })
+  }, [authenticated])
+  useEffect(() => {
+    if (!authenticated) return
+    let cancelled = false
+    const migrate = async () => {
+      const legacyData = readLegacyData()
+      if (Object.keys(legacyData).length === 0) return
+      const imported = await importLegacyData(legacyData)
+      if (cancelled) return
+      try {
+        clearImportedLegacyData(imported)
+      } catch (error) {
+        setNotice(
+          `Browser data was imported, but the old local copy could not be cleared: ${getErrorMessage(error)}`,
+        )
+        return
+      }
+      const count = imported.menu + imported.customers + imported.orders
+      if (count === 0 && !imported.settings) {
+        setNotice(
+          "Firebase already has data in these collections. Existing browser data was left untouched.",
+        )
+        return
+      }
+      setNotice(
+        `Imported ${imported.menu} menu items, ${imported.customers} customer records, ${imported.orders} orders${imported.settings ? " and cafe settings" : ""} from this browser to Firebase.`,
+      )
+    }
+    void migrate().catch((error: unknown) => {
+      setNotice(`Could not migrate browser data to Firebase: ${getErrorMessage(error)}`)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [authenticated])
   useEffect(() => {
     const update = () => {
       setRoute(window.location.hash)
@@ -486,6 +709,7 @@ export default function App() {
     return () => window.removeEventListener("hashchange", update)
   }, [])
   useEffect(() => {
+    if (!authReady) return
     if (route === "#/admin" && !authenticated) {
       window.location.hash = "/login"
       return
@@ -494,7 +718,7 @@ export default function App() {
       window.location.hash = "/admin"
       return
     }
-  }, [route, authenticated])
+  }, [route, authenticated, authReady])
   useEffect(() => {
     const adminPage = route === "#/admin" || route === "#/login"
     document.title = adminPage
@@ -508,9 +732,9 @@ export default function App() {
     const id = setTimeout(() => setNotice(""), 4500)
     return () => clearTimeout(id)
   }, [notice])
-  const persistMenu = (next: MenuItem[]) => {
+  const persistMenu = async (next: MenuItem[]) => {
     try {
-      localStorage.setItem("lalazar.menu.v1", JSON.stringify(next))
+      await saveMenuItems(menu, next)
       setMenu(next)
       setCart((current) =>
         current.flatMap((item) => {
@@ -521,50 +745,39 @@ export default function App() {
         }),
       )
       return true
-    } catch {
-      setNotice(
-        "Your browser could not save changes. Please enable browser storage.",
-      )
+    } catch (error) {
+      setNotice(`Could not save the menu to Firebase: ${getErrorMessage(error)}`)
       return false
     }
   }
-  const saveWhatsapp = (number: string) => {
+  const saveCustomersToFirebase = async (next: CustomerRecord[]) => {
     try {
-      localStorage.setItem("lalazar.whatsapp.v1", JSON.stringify(number))
-      setWhatsapp(number)
-      return true
-    } catch {
-      setNotice("Your browser could not save settings.")
-      return false
-    }
-  }
-  const saveCustomers = (next: CustomerRecord[]) => {
-    try {
-      localStorage.setItem("lalazar.customers.v1", JSON.stringify(next))
+      await persistCustomers(customers, next)
       setCustomers(next)
       return true
-    } catch {
-      setNotice("Your browser could not save customer records.")
+    } catch (error) {
+      setNotice(`Could not save customer records to Firebase: ${getErrorMessage(error)}`)
       return false
     }
   }
-  const saveOrders = (next: CustomerOrderRecord[]) => {
+  const saveOrdersToFirebase = async (next: CustomerOrderRecord[]) => {
     try {
-      localStorage.setItem("lalazar.orders.v1", JSON.stringify(next))
+      await persistOrders(orders, next)
       setOrders(next)
       return true
-    } catch {
-      setNotice("Your browser could not save order records.")
+    } catch (error) {
+      setNotice(`Could not save orders to Firebase: ${getErrorMessage(error)}`)
       return false
     }
   }
-  const saveContactInfo = (next: ContactInfo) => {
+  const saveContactInfoToFirebase = async (next: ContactInfo) => {
     try {
-      localStorage.setItem("lalazar.contact.v1", JSON.stringify(next))
+      await saveCafeSettings(next)
       setContactInfo(next)
+      setWhatsapp(next.phone.replace(/\D/g, ""))
       return true
-    } catch {
-      setNotice("Your browser could not save contact details.")
+    } catch (error) {
+      setNotice(`Could not save cafe settings to Firebase: ${getErrorMessage(error)}`)
       return false
     }
   }
@@ -598,33 +811,27 @@ export default function App() {
         <Admin
           menu={menu}
           saveMenu={persistMenu}
-          whatsapp={whatsapp}
-          saveWhatsapp={saveWhatsapp}
-          requests={requests}
           customers={customers}
           orders={orders}
           contactInfo={contactInfo}
-          saveCustomers={saveCustomers}
-          saveOrders={saveOrders}
-          saveContactInfo={saveContactInfo}
+          saveCustomers={saveCustomersToFirebase}
+          saveOrders={saveOrdersToFirebase}
+          saveContactInfo={saveContactInfoToFirebase}
           authenticated={authenticated}
-          login={() => {
-            try {
-              sessionStorage.setItem("lalazar.demo.session", "active")
-            } catch {
-              /* Session remains available in memory. */
-            }
-            setAuthenticated(true)
+          authReady={authReady}
+          login={async (email, password) => {
+            const admin = await signInAdmin(email, password)
+            setUser(admin)
             window.location.hash = "/admin"
           }}
-          logout={() => {
+          logout={async () => {
             try {
-              sessionStorage.removeItem("lalazar.demo.session")
-            } catch {
-              /* No stored session to clear. */
+              await signOutAdmin()
+              setUser(null)
+              window.location.hash = "/login"
+            } catch (error) {
+              setNotice(`Could not sign out of Firebase: ${getErrorMessage(error)}`)
             }
-            setAuthenticated(false)
-            window.location.hash = "/login"
           }}
         />
         {notice && (
@@ -638,8 +845,15 @@ export default function App() {
   const filtered = menu.filter(
     (item) => category === "All" || item.category === category,
   )
+  const featured = [menu[0], menu[6], menu[10]].filter(
+    (item): item is MenuItem => item !== undefined,
+  )
   const visible =
-    category === "All" && !expanded ? [menu[0], menu[6], menu[10]] : filtered
+    category === "All" && !expanded
+      ? featured.length === 3
+        ? featured
+        : filtered.slice(0, 3)
+      : filtered
   return (
     <div className="site-shell">
       <header className="site-header">
@@ -826,7 +1040,9 @@ export default function App() {
                 </button>
               ))}
             </div>
-            <span className="menu-count">23 dishes. Endless delight.</span>
+            <span className="menu-count">
+              {menu.length} dishes. Endless delight.
+            </span>
           </div>
           <div className="menu-grid">
             {visible.map((item) => {
@@ -904,7 +1120,7 @@ export default function App() {
               </button>
               <span>
                 {expanded
-                  ? "All 23 dishes, freshly made for you."
+                  ? `All ${menu.length} dishes, freshly made for you.`
                   : "Something for every craving."}
               </span>
             </div>
@@ -1140,10 +1356,11 @@ export default function App() {
             cart={cart}
             total={total}
             openWhatsApp={openWhatsApp}
-            onHandoff={(customer) => {
-              const orderId = `LC-${Date.now().toString().slice(-6)}`
+            onHandoff={async (customer) => {
+              const uniqueId = crypto.randomUUID().replace(/-/g, "").slice(0, 10)
+              const orderId = `LC-${Date.now()}-${uniqueId}`
               const createdAt = new Date().toISOString()
-              const customerId = `CUST-${Date.now().toString().slice(-6)}`
+              const customerId = `CUST-${uniqueId}`
               const nextOrder: CustomerOrderRecord = {
                 id: orderId,
                 customerId,
@@ -1164,51 +1381,21 @@ export default function App() {
                 notes: customer.notes,
                 timeline: createTimeline(createdAt, "Pending"),
               }
-              const matchingCustomer = customers.find(
-                (record) =>
-                  toPhoneDigits(record.phone) === toPhoneDigits(customer.phone),
-              )
-              const nextCustomers = matchingCustomer
-                ? customers.map((record) =>
-                    record.id === matchingCustomer.id
-                      ? {
-                          ...record,
-                          name: customer.name,
-                          phone: customer.phone,
-                          address: customer.address,
-                          notes: customer.notes,
-                        }
-                      : record,
-                  )
-                : [
-                    {
-                      id: customerId,
-                      name: customer.name,
-                      phone: customer.phone,
-                      email: "",
-                      address: customer.address,
-                      notes: customer.notes,
-                      createdAt,
-                    },
-                    ...customers,
-                  ]
-              setCustomers(nextCustomers)
-              setRequests((current) => [
-                {
-                  id: orderId,
-                  items: count,
-                  total,
-                  time: new Date().toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  }),
-                },
-                ...current,
-              ])
-              setOrders((current) => [nextOrder, ...current])
+              const nextCustomer: CustomerRecord = {
+                id: customerId,
+                name: customer.name,
+                phone: customer.phone,
+                email: "",
+                address: customer.address,
+                notes: customer.notes,
+                createdAt,
+                orderId,
+              }
+              await createOrder(nextOrder, nextCustomer)
+              setCart([])
               close()
               setNotice(
-                "WhatsApp opened. Please send your message to request your order.",
+                "Your request was saved securely. Please send the WhatsApp message to complete the request.",
               )
             }}
           />
@@ -1273,10 +1460,10 @@ function Checkout({
     address: string
     phone: string
     notes: string
-  }) => void
+  }) => Promise<void>
 }) {
   const [error, setError] = useState("")
-  const submit = (e: FormEvent<HTMLFormElement>) => {
+  const submit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     const data = new FormData(e.currentTarget)
     const name = String(data.get("name")).trim(),
@@ -1297,7 +1484,11 @@ function Checkout({
     openWhatsApp(
       `Hello Lalazar Cafe! I would like to place an order.\n\n${cart.map((item) => `${item.name} × ${item.qty} — ${MONEY(item.price * item.qty)}`).join("\n")}\n\nSubtotal: ${MONEY(total)}\nFull name: ${name}\nDelivery address: ${address}\nContact number: ${phone}\nNotes: ${notes || "None"}\n\nPlease confirm availability, delivery charges and total.`,
     )
-    onHandoff({ name, address, phone, notes })
+    try {
+      await onHandoff({ name, address, phone, notes })
+    } catch (handoffError) {
+      setError(`We could not save your order. ${getErrorMessage(handoffError)}`)
+    }
   }
   return (
     <form className="form-stack" onSubmit={submit}>
@@ -1365,8 +1556,8 @@ function Checkout({
         Send order on WhatsApp <Icon name="arrow" />
       </button>
       <p className="form-help">
-        Your details are included only in your WhatsApp message. Send the
-        message to request your order; our team will confirm it.
+        Your order details are saved securely for cafe staff and included in
+        WhatsApp. Send the message so our team can confirm it.
       </p>
     </form>
   )
@@ -1473,9 +1664,6 @@ function Reservation({
 function Admin({
   menu,
   saveMenu,
-  whatsapp,
-  saveWhatsapp,
-  requests,
   customers,
   orders,
   contactInfo,
@@ -1483,28 +1671,28 @@ function Admin({
   saveOrders,
   saveContactInfo,
   authenticated,
+  authReady,
   login,
   logout,
 }: {
   menu: MenuItem[]
-  saveMenu: (menu: MenuItem[]) => boolean
-  whatsapp: string
-  saveWhatsapp: (number: string) => boolean
-  requests: RequestRecord[]
+  saveMenu: (menu: MenuItem[]) => Promise<boolean>
   customers: CustomerRecord[]
   orders: CustomerOrderRecord[]
   contactInfo: ContactInfo
-  saveCustomers: (customers: CustomerRecord[]) => boolean
-  saveOrders: (orders: CustomerOrderRecord[]) => boolean
-  saveContactInfo: (contactInfo: ContactInfo) => boolean
+  saveCustomers: (customers: CustomerRecord[]) => Promise<boolean>
+  saveOrders: (orders: CustomerOrderRecord[]) => Promise<boolean>
+  saveContactInfo: (contactInfo: ContactInfo) => Promise<boolean>
   authenticated: boolean
-  login: () => void
-  logout: () => void
+  authReady: boolean
+  login: (email: string, password: string) => Promise<void>
+  logout: () => Promise<void>
 }) {
   const [tab, setTab] = useState<
     "overview" | "menu" | "orders" | "customers" | "settings"
   >("overview")
   const [error, setError] = useState("")
+  const [authLoading, setAuthLoading] = useState(false)
   const [feedback, setFeedback] = useState("")
   const [query, setQuery] = useState("")
   const [edit, setEdit] = useState<MenuItem | null>(null)
@@ -1519,6 +1707,30 @@ function Admin({
     createdAt: new Date().toISOString(),
   })
   const [customerQuery, setCustomerQuery] = useState("")
+  const restorePreviousMenuItems = async () => {
+    const existingNames = new Set(
+      menu.map((item) => item.name.trim().toLowerCase()),
+    )
+    const missingItems = MENU.filter(
+      (item) => !existingNames.has(item.name.trim().toLowerCase()),
+    )
+    if (missingItems.length === 0) {
+      setFeedback("All earlier menu items are already listed.")
+      return
+    }
+
+    const firstAvailableId =
+      menu.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1
+    const restoredItems = missingItems.map((item, index) => ({
+      ...item,
+      id: firstAvailableId + index,
+    }))
+    if (await saveMenu([...menu, ...restoredItems])) {
+      setFeedback(
+        `Restored ${restoredItems.length} earlier menu item${restoredItems.length === 1 ? "" : "s"} alongside the current menu.`,
+      )
+    }
+  }
   const closeEdit = useRef(() => {
     setEdit(null)
     setIsNewDish(false)
@@ -1544,32 +1756,29 @@ function Admin({
     },
   ]
 
-  const totalToday = orders.filter((order) => {
-    const created = new Date(order.createdAt)
-    const now = new Date()
-    return (
-      created.getDate() === now.getDate() &&
-      created.getMonth() === now.getMonth() &&
-      created.getFullYear() === now.getFullYear()
-    )
-  }).length
-  const totalWeek = orders.filter((order) => {
-    const created = new Date(order.createdAt)
-    const diffDays = Math.floor((Date.now() - created.getTime()) / 86400000)
-    return diffDays <= 7
-  }).length
-  const totalMonth = orders.filter((order) => {
-    const created = new Date(order.createdAt)
-    const diffDays = Math.floor((Date.now() - created.getTime()) / 86400000)
-    return diffDays <= 30
-  }).length
+  const revenueToday = getRevenueBuckets(orders, "day").reduce(
+    (total, bucket) => total + bucket.amount,
+    0,
+  )
+  const revenueThisWeek = getRevenueBuckets(orders, "week").reduce(
+    (total, bucket) => total + bucket.amount,
+    0,
+  )
+  const revenueThisMonth = getRevenueBuckets(orders, "month").reduce(
+    (total, bucket) => total + bucket.amount,
+    0,
+  )
+  const uniqueCustomers = countUniqueCustomers(orders)
+  const repeatCustomers = countRepeatCustomers(orders)
   const topItem = Object.entries(
-    orders.reduce<Record<string, number>>((all, order) => {
+    orders
+      .filter((order) => order.status !== "Cancelled")
+      .reduce<Record<string, number>>((all, order) => {
       order.items.forEach((item) => {
         all[item.name] = (all[item.name] ?? 0) + item.qty
       })
       return all
-    }, {}),
+      }, {}),
   ).sort((a, b) => b[1] - a[1])[0]
 
   if (!authenticated)
@@ -1606,16 +1815,22 @@ function Admin({
             <p>Sign in to your cafe dashboard.</p>
             <form
               className="form-stack"
-              onSubmit={(e) => {
+              onSubmit={async (e) => {
                 e.preventDefault()
+                if (authLoading) return
+                setAuthLoading(true)
                 const data = new FormData(e.currentTarget)
-                if (
-                  data.get("email") === "admin@lalazar.cafe" &&
-                  data.get("password") === "Lalazar123!"
-                ) {
+                try {
+                  await login(
+                    String(data.get("email")),
+                    String(data.get("password")),
+                  )
                   setError("")
-                  login()
-                } else setError("Use the demo email and password shown below.")
+                } catch (loginError) {
+                  setError(getAuthErrorMessage(loginError))
+                } finally {
+                  setAuthLoading(false)
+                }
               }}
             >
               <label>
@@ -1625,7 +1840,7 @@ function Admin({
                   name="email"
                   autoComplete="username"
                   required
-                  placeholder="admin@lalazar.cafe"
+                  placeholder={ADMIN_EMAIL}
                 />
               </label>
               <label>
@@ -1643,22 +1858,25 @@ function Admin({
                   {error}
                 </p>
               )}
-              <button className="button button-primary" type="submit">
-                Sign in <Icon name="arrow" />
+              <button
+                className="button button-primary"
+                type="submit"
+                disabled={authLoading || !authReady || !firebaseConfigured}
+              >
+                {authLoading ? "Signing in..." : "Sign in"}
+                {!authLoading && <Icon name="arrow" />}
               </button>
             </form>
             <div className="demo-note">
               <Icon name="lock" />
               <div>
-                <strong>Demo workspace · not secure authentication</strong>
+                <strong>Firebase administrator sign-in</strong>
                 <p>
-                  Email: <code>admin@lalazar.cafe</code>
-                  <br />
-                  Password: <code>Lalazar123!</code>
+                  Authorized email: <code>{ADMIN_EMAIL}</code>
                 </p>
                 <small>
-                  This is a browser-only preview. Production access requires
-                  server-side authentication.
+                  Use the password for this verified Firebase Authentication
+                  account. Do not create public sign-ups for admin access.
                 </small>
               </div>
             </div>
@@ -1700,7 +1918,7 @@ function Admin({
             <Icon name="logout" />
             Sign out
           </button>
-          <small>LOCAL DEMO WORKSPACE</small>
+          <small>FIREBASE WORKSPACE</small>
         </div>
       </aside>
       <main className="admin-main">
@@ -1716,9 +1934,8 @@ function Admin({
         <div className="admin-demo-banner">
           <Icon name="lock" />
           <span>
-            Demo mode. Menu, contacts and orders are saved in this browser only.
-            This keeps admin access private and the dashboard practical for local
-            preview work.
+            Connected to Firebase. Menu and cafe settings are public; customer
+            and order records are restricted to the verified administrator.
           </span>
         </div>
         {feedback && (
@@ -1735,15 +1952,40 @@ function Admin({
               <p>A quick view of your cafe operations and order performance.</p>
             </div>
             <div className="stats-grid">
-              <Stat label="Orders today" value={totalToday.toString()} icon="bag" />
-              <Stat label="Orders this week" value={totalWeek.toString()} icon="grid" />
-              <Stat label="Orders this month" value={totalMonth.toString()} icon="check" />
+              <Stat label="Revenue today" value={MONEY(revenueToday)} icon="bag" />
               <Stat
-                label="Top item"
-                value={topItem ? topItem[0] : "No orders"}
+                label="Revenue this week"
+                value={MONEY(revenueThisWeek)}
+                icon="grid"
+              />
+              <Stat
+                label="Revenue this month"
+                value={MONEY(revenueThisMonth)}
+                icon="check"
+              />
+              <Stat
+                label="Most ordered item"
+                value={topItem ? `${topItem[0]} (${topItem[1]})` : "No orders"}
                 icon="utensils"
               />
+              <Stat
+                label="Unique customers"
+                value={uniqueCustomers.toString()}
+                icon="heart"
+              />
+              <Stat
+                label="Repeat customers"
+                value={repeatCustomers.toString()}
+                icon="check"
+              />
             </div>
+            <RevenueChart orders={orders} />
+            <p className="analytics-note">
+              Revenue includes confirmed, preparing, out-for-delivery, and
+              delivered orders; pending and cancelled orders are excluded.
+              Customer counts are matched by phone number. Website visits aren’t
+              tracked in this dashboard.
+            </p>
             <div className="admin-overview-grid">
               <section className="admin-panel">
                 <span className="eyebrow">MAKE IT YOURS</span>
@@ -1772,7 +2014,7 @@ function Admin({
               </div>
               <OrderTable
                 orders={orders.slice(0, 5)}
-                onStatusChange={(id, status) => {
+                onStatusChange={async (id, status) => {
                   const next = orders.map((order) => {
                     if (order.id !== id) return order
                     const timeline = ORDER_STATUS_FLOW.map((step) => {
@@ -1791,8 +2033,7 @@ function Admin({
                       timeline,
                     }
                   })
-                  saveOrders(next)
-                  setFeedback("Order status updated.")
+                  if (await saveOrders(next)) setFeedback("Order status updated.")
                 }}
               />
             </section>
@@ -1807,6 +2048,12 @@ function Admin({
                 <p>Add, edit or remove dishes and adjust item availability.</p>
               </div>
               <div className="panel-actions">
+                <button
+                  className="button button-outline"
+                  onClick={() => void restorePreviousMenuItems()}
+                >
+                  Restore earlier menu items
+                </button>
                 <button
                   className="button button-primary"
                   onClick={() => {
@@ -1874,16 +2121,14 @@ function Admin({
                             className={`availability ${item.available !== false ? "available" : ""}`}
                             aria-label={`Toggle availability for ${item.name}`}
                             aria-pressed={item.available !== false}
-                            onClick={() => {
-                              if (
-                                saveMenu(
-                                  menu.map((value) =>
-                                    value.id === item.id
-                                      ? { ...value, available: value.available === false }
-                                      : value,
-                                  ),
-                                )
-                              )
+                            onClick={async () => {
+                              if (await saveMenu(
+                                menu.map((value) =>
+                                  value.id === item.id
+                                    ? { ...value, available: value.available === false }
+                                    : value,
+                                ),
+                              ))
                                 setFeedback(`${item.name} availability updated.`)
                             }}
                           >
@@ -1906,9 +2151,9 @@ function Admin({
                             <button
                               className="icon-button danger"
                               aria-label={`Delete ${item.name}`}
-                              onClick={() => {
+                              onClick={async () => {
                                 const nextMenu = menu.filter((value) => value.id !== item.id)
-                                if (saveMenu(nextMenu)) setFeedback(`${item.name} removed from the menu.`)
+                                if (await saveMenu(nextMenu)) setFeedback(`${item.name} removed from the menu.`)
                               }}
                             >
                               <Icon name="close" />
@@ -1942,7 +2187,7 @@ function Admin({
             </div>
             <OrderTable
               orders={orders}
-              onStatusChange={(id, status) => {
+              onStatusChange={async (id, status) => {
                 const next = orders.map((order) => {
                   if (order.id !== id) return order
                   const timeline = ORDER_STATUS_FLOW.map((step) => {
@@ -1961,8 +2206,7 @@ function Admin({
                     timeline,
                   }
                 })
-                saveOrders(next)
-                setFeedback("Order status updated.")
+                if (await saveOrders(next)) setFeedback("Order status updated.")
               }}
             />
           </section>
@@ -1987,7 +2231,7 @@ function Admin({
             </div>
             <form
               className="customer-form form-stack"
-              onSubmit={(e) => {
+              onSubmit={async (e) => {
                 e.preventDefault()
                 const nextCustomer = {
                   ...customerForm,
@@ -2005,7 +2249,7 @@ function Admin({
                 const nextCustomers = exists
                   ? customers.map((customer) => (customer.id === nextCustomer.id ? nextCustomer : customer))
                   : [{ ...nextCustomer, id: `CUST-${Date.now().toString().slice(-6)}` }, ...customers]
-                if (saveCustomers(nextCustomers)) {
+                if (await saveCustomers(nextCustomers)) {
                   setCustomerForm({ id: "", name: "", phone: "", email: "", address: "", notes: "", createdAt: new Date().toISOString() })
                   setFeedback(exists ? "Customer record saved." : "Customer added.")
                   setError("")
@@ -2064,9 +2308,9 @@ function Admin({
             <CustomerTable
               customers={customers.filter((customer) => `${customer.name} ${customer.phone} ${customer.address}`.toLowerCase().includes(customerQuery.toLowerCase()))}
               onEdit={(customer) => setCustomerForm({ ...customer })}
-              onDelete={(id) => {
+              onDelete={async (id) => {
                 const nextCustomers = customers.filter((customer) => customer.id !== id)
-                if (saveCustomers(nextCustomers)) setFeedback("Customer record removed.")
+                if (await saveCustomers(nextCustomers)) setFeedback("Customer record removed.")
               }}
             />
           </section>
@@ -2079,7 +2323,7 @@ function Admin({
             <p>This contact information is used for online order requests and customer communication.</p>
             <form
               className="form-stack"
-              onSubmit={(e) => {
+              onSubmit={async (e) => {
                 e.preventDefault()
                 const data = new FormData(e.currentTarget)
                 const next = {
@@ -2092,9 +2336,8 @@ function Admin({
                   setError("Please enter a valid WhatsApp number in international digits.")
                   return
                 }
-                if (saveWhatsapp(next.phone)) {
+                if (await saveContactInfo(next)) {
                   setError("")
-                  saveContactInfo(next)
                   setFeedback("Contact details saved successfully.")
                 }
               }}
@@ -2130,7 +2373,7 @@ function Admin({
         <Dialog title={isNewDish ? "Add a new dish" : `Edit ${edit.name}`} close={closeEdit}>
           <form
             className="form-stack"
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault()
               const data = new FormData(e.currentTarget)
               const price = Number(data.get("price"))
@@ -2153,7 +2396,7 @@ function Admin({
                 available: data.get("available") !== "false",
               }
               const nextMenu = isNewDish ? [...menu, nextItem] : menu.map((item) => (item.id === edit.id ? nextItem : item))
-              if (saveMenu(nextMenu)) {
+              if (await saveMenu(nextMenu)) {
                 setEdit(null)
                 setIsNewDish(false)
                 setFeedback(isNewDish ? "Dish added to the menu." : "Dish updated. Your website menu is up to date.")
@@ -2207,6 +2450,73 @@ function Admin({
         </Dialog>
       )}
     </div>
+  )
+}
+
+function RevenueChart({ orders }: { orders: CustomerOrderRecord[] }) {
+  const [period, setPeriod] = useState<RevenuePeriod>("week")
+  const buckets = getRevenueBuckets(orders, period)
+  const total = buckets.reduce((sum, bucket) => sum + bucket.amount, 0)
+  const maxAmount = Math.max(...buckets.map((bucket) => bucket.amount), 0)
+  const periodLabels: Record<RevenuePeriod, string> = {
+    day: "Today",
+    week: "This week",
+    month: "This month",
+  }
+
+  return (
+    <section className="admin-panel revenue-panel">
+      <div className="panel-title">
+        <div>
+          <span className="eyebrow">ORDER PERFORMANCE</span>
+          <h2>Revenue</h2>
+          <p>
+            {periodLabels[period]} · {MONEY(total)} from eligible orders
+          </p>
+        </div>
+        <div className="revenue-periods" role="group" aria-label="Revenue period">
+          {(["day", "week", "month"] as const).map((value) => (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={period === value}
+              className={period === value ? "selected" : ""}
+              onClick={() => setPeriod(value)}
+            >
+              {periodLabels[value]}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div
+        className={`revenue-chart revenue-chart-${period}`}
+        role="img"
+        aria-label={`${periodLabels[period]} revenue chart totaling ${MONEY(total)}`}
+      >
+        {buckets.map((bucket, index) => (
+          <div className="revenue-column" key={bucket.key}>
+            <span className="revenue-value">{bucket.amount ? MONEY(bucket.amount) : ""}</span>
+            <div className="revenue-bar-track">
+              <div
+                className="revenue-bar"
+                style={{
+                  height: maxAmount
+                    ? `${Math.max(3, (bucket.amount / maxAmount) * 100)}%`
+                    : "0%",
+                }}
+                title={`${bucket.label}: ${MONEY(bucket.amount)}`}
+              />
+            </div>
+            {(period === "week" ||
+              (period === "day" && index % 3 === 0) ||
+              (period === "month" &&
+                (index % 5 === 0 || index === buckets.length - 1))) && (
+              <span className="revenue-label">{bucket.label}</span>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 
